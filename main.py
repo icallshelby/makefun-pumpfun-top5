@@ -16,6 +16,18 @@ def above(x, mean, sd):
     sd = max(sd, 1e-5)
     return 0.5 * erfcc((x - mean) / (sd * math.sqrt(2.0)))
 
+class LCG:
+    def __init__(self, seed=1337):
+        self.state = seed
+    def next(self):
+        self.state = (1103515245 * self.state + 12345) % 2**31
+        return self.state / 2**31
+
+def sample_normal(rng):
+    u1 = max(1e-10, rng.next())
+    u2 = rng.next()
+    return math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+
 def main():
     input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
     output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
@@ -52,24 +64,39 @@ def main():
                 "venue": r.get("venue", "curve")
             })
 
-    probabilities = []
-    sizes = []
+    candidates = []
+    seen_mints = set()
 
-    for place in range(1, places + 1):
-        target_coin = chart[place - 1]
-        mint = target_coin["mint"]
-        venue = target_coin.get("venue", "curve")
-        current_cap = int(target_coin["market_cap_lamports"])
+    for r in chart[:40]:
+        mint = r["mint"]
+        if mint not in seen_mints:
+            seen_mints.add(mint)
+            candidates.append(mint)
+
+    for mint, history in coin_history.items():
+        if mint not in seen_mints:
+            log_caps = [math.log10(h["cap"]) for h in history]
+            vel = (log_caps[-1] - log_caps[0]) if len(log_caps) >= 2 else 0.0
+            if vel > 0.02 or len(history) >= 2:
+                seen_mints.add(mint)
+                candidates.append(mint)
+
+    for r in chart:
+        if r["mint"] not in seen_mints:
+            seen_mints.add(r["mint"])
+            candidates.append(r["mint"])
+
+    candidate_data = {}
+    for mint in candidates:
+        history = coin_history.get(mint, [{"cap": chart[0]["market_cap_lamports"], "venue": "curve"}])
+        latest = history[-1]
+        current_cap = latest["cap"]
         current_log_cap = math.log10(current_cap)
+        venue = latest["venue"]
 
-        history = coin_history.get(mint, [])
-        
-        velocity = 0.0
         log_caps = [math.log10(h["cap"]) for h in history]
-        if len(history) >= 2:
-            velocity = log_caps[-1] - log_caps[0]
+        velocity = (log_caps[-1] - log_caps[0]) / (len(log_caps) - 1) if len(log_caps) >= 2 else 0.0
 
-        # Size sigma from trajectory variance (floor 0.15, cap 0.6)
         if len(log_caps) >= 2:
             mean_lc = sum(log_caps) / len(log_caps)
             variance = sum((lc - mean_lc) ** 2 for lc in log_caps) / (len(log_caps) - 1)
@@ -78,36 +105,83 @@ def main():
         else:
             sigma = 0.35
 
-        # Project cap 1-2h forward
-        proj_growth = velocity * 0.5 + (0.10 if venue == "pool" else 0.03)
-        projected_log_cap = current_log_cap + proj_growth
+        shrink = 0.4
+        venue_boost = 0.05 if venue == "pool" else 0.0
+        projected_log_cap = current_log_cap + shrink * velocity + venue_boost
 
-        # Order model: balance persistence with sensible unnamed share for rank churn at 1-2h
-        venue_bonus = 0.08 if venue == "pool" else 0.02
-        velocity_bonus = min(0.04, max(-0.02, velocity * 0.02))
-        p_stay = min(0.48, round(0.35 + venue_bonus + velocity_bonus, 6))
+        candidate_data[mint] = {
+            "mint": mint,
+            "current_cap": current_cap,
+            "current_log_cap": current_log_cap,
+            "projected_log_cap": projected_log_cap,
+            "sigma": sigma,
+            "venue": venue,
+            "velocity": velocity
+        }
 
-        place_probs = []
-        place_probs.append({"mint": mint, "place": place, "p": p_stay})
-        current_sum = p_stay
+    rng = LCG(seed=1337)
+    draws = 4000
+    place_counts = {p: {} for p in range(1, places + 1)}
 
-        if place > 1:
-            prev_coin = chart[place - 2]
-            p_prev = 0.10 if prev_coin.get("venue") == "pool" else 0.07
-            if current_sum + p_prev <= 0.99:
-                place_probs.append({"mint": prev_coin["mint"], "place": place, "p": p_prev})
-                current_sum += p_prev
+    cand_list = list(candidate_data.values())
 
-        if place < len(chart):
-            next_coin = chart[place]
-            p_next = 0.10 if next_coin.get("venue") == "pool" else 0.07
-            if current_sum + p_next <= 0.99:
-                place_probs.append({"mint": next_coin["mint"], "place": place, "p": p_next})
-                current_sum += p_next
+    for _ in range(draws):
+        simulated = []
+        for c in cand_list:
+            sim_val = c["projected_log_cap"] + sample_normal(rng) * c["sigma"]
+            simulated.append((sim_val, c["mint"]))
+        simulated.sort(key=lambda x: x[0], reverse=True)
 
-        probabilities.extend(place_probs)
+        for place_idx in range(places):
+            if place_idx < len(simulated):
+                place = place_idx + 1
+                mint = simulated[place_idx][1]
+                place_counts[place][mint] = place_counts[place].get(mint, 0) + 1
 
-        # Size distribution
+    probabilities = []
+    for place in range(1, places + 1):
+        counts = place_counts[place]
+        raw_place_probs = []
+        for mint, cnt in counts.items():
+            p = cnt / draws
+            if p >= 0.01:
+                p = min(0.35, p)
+                raw_place_probs.append((mint, p))
+        
+        total_p = sum(p for _, p in raw_place_probs)
+        if total_p > 0.55:
+            scale = 0.50 / total_p
+            raw_place_probs = [(m, p * scale) for m, p in raw_place_probs]
+
+        for mint, p in raw_place_probs:
+            probabilities.append({"mint": mint, "place": place, "p": round(p, 6)})
+
+    sorted_by_proj = sorted(cand_list, key=lambda c: c["projected_log_cap"], reverse=True)
+    top5 = []
+    for c in sorted_by_proj:
+        if c["mint"] not in top5:
+            top5.append(c["mint"])
+        if len(top5) == 5:
+            break
+
+    if len(top5) < places:
+        for r in chart:
+            if r["mint"] not in top5:
+                top5.append(r["mint"])
+            if len(top5) == places:
+                break
+
+    sizes = []
+    for place in range(1, places + 1):
+        target_mint = top5[place - 1] if place - 1 < len(top5) else chart[place - 1]["mint"]
+        c_data = candidate_data.get(target_mint)
+        if c_data:
+            projected_log_cap = c_data["projected_log_cap"]
+            sigma = c_data["sigma"]
+        else:
+            projected_log_cap = math.log10(chart[place - 1]["market_cap_lamports"])
+            sigma = 0.35
+
         mean_log_cap_centered = projected_log_cap - 9.0
         micro = 1_000_000
         for bin_idx in range(len(edges) + 1):
@@ -120,7 +194,6 @@ def main():
                 p_val = round(u / micro, 6)
                 sizes.append({"place": place, "bin": bin_idx, "p": p_val})
 
-    top5 = [r["mint"] for r in chart[:places]]
     if len(set(top5)) != 5:
         raise RuntimeError("Top 5 must contain exactly 5 distinct mints")
 
